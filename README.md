@@ -18,7 +18,9 @@ If that sounds familiar, your apps are very likely being killed by
 ```bash
 git clone https://github.com/xaviware/ubuntu-memory-crash-solver.git
 cd ubuntu-memory-crash-solver
-sudo bash fix-memory.sh
+sudo bash fix-memory.sh              # oomd + zswap
+# or, to also grow the swap file to 8 GB:
+sudo bash fix-memory.sh --swap 8G
 sudo reboot
 ```
 
@@ -27,7 +29,9 @@ The script:
 1. **Relaxes `systemd-oomd`** from `50% / 20s` to `85% / 60s` (swap limit
    `90%` → `95%`). It still protects against real OOM, but stops killing apps
    during moderate memory pressure.
-2. **Enables `zswap` with `zstd`** (up to 40% of RAM) persistently via
+2. **Optionally grows the active swap file** to a size you choose with
+   `--swap SIZE` (e.g. `--swap 8G`). It only enlarges, never shrinks.
+3. **Enables `zswap` with `zstd`** (up to 40% of RAM) persistently via
    GRUB + initramfs, so pages are compressed in RAM instead of thrashing a slow
    disk.
 
@@ -114,7 +118,26 @@ Result: the user session is only acted on when pressure is **> 85% for 60 s**,
 instead of **> 50% for 20 s**. The kernel OOM killer still handles genuine
 exhaustion.
 
-### 2. `zswap` with `zstd`
+### 2. Optional: grow the swap file
+
+```bash
+sudo bash fix-memory.sh --swap 8G
+```
+
+The script detects the active swap **file** (not a partition), backs up nothing
+here, and:
+
+- only grows it (requesting a smaller size is a no-op);
+- runs `swapoff`, `fallocate` (with a `dd` fallback), `chmod 600`, `mkswap`,
+  and `swapon`;
+- does **not** modify `/etc/fstab` (the path stays the same).
+
+`swapoff` pulls swapped pages back into RAM, so close heavy apps first. On an
+8 GB machine with `zswap`, 8 GB of swap is a reasonable amount of headroom. On
+a 5400 rpm HDD, `zswap` absorbs most of the traffic; the disk is only used when
+the compressed pool is full.
+
+### 3. `zswap` with `zstd`
 
 - Adds `zstd` and `lz4` to `/etc/initramfs-tools/modules`.
 - Adds `zswap.enabled=1 zswap.compressor=zstd zswap.max_pool_percent=40` to
@@ -144,8 +167,21 @@ choice when there is no swap storage at all.
 
 ## Usage
 
+```text
+sudo bash fix-memory.sh [--swap SIZE]
+
+  (no options)   Relax systemd-oomd and enable zswap (zstd).
+  --swap SIZE    Also grow the active swap file to SIZE (e.g. 8G, 8192M).
+                 Only enlarges; needs free disk space and enough RAM for the
+                 temporary swapoff.
+  -h, --help     Show help.
+```
+
+Examples:
+
 ```bash
-sudo bash fix-memory.sh
+sudo bash fix-memory.sh              # oomd + zswap
+sudo bash fix-memory.sh --swap 8G    # oomd + zswap + 8 GB swap
 sudo reboot
 ```
 
@@ -158,6 +194,10 @@ of any file it modifies, and prints a verification summary.
 # oomd thresholds
 oomctl | head -20
 # expect: Memory Pressure Limit: 85.00% / Duration: 60s
+
+# swap
+swapon --show
+free -h
 
 # zswap
 cat /sys/module/zswap/parameters/enabled          # Y
@@ -217,6 +257,19 @@ sudo update-initramfs -u
 sudo update-grub
 sudo reboot
 ```
+
+### Grow the swap file
+
+```bash
+# Close heavy apps first: swapoff moves pages back into RAM.
+sudo swapoff /swap.img
+sudo fallocate -l 8G /swap.img      # or: sudo dd if=/dev/zero of=/swap.img bs=1M count=8192
+sudo chmod 600 /swap.img
+sudo mkswap /swap.img
+sudo swapon /swap.img
+```
+
+`/etc/fstab` does not need to change (same path). Verify with `swapon --show`.
 
 ---
 

@@ -8,14 +8,57 @@
 #
 # Este script:
 #   1) Vuelve systemd-oomd mucho menos agresivo (85% / 60s, swap 95%).
-#   2) Activa zswap con zstd (compresion de memoria, recomendado por Ubuntu
+#   2) Opcionalmente amplia el swapfile activo (--swap SIZE).
+#   3) Activa zswap con zstd (compresion de memoria, recomendado por Ubuntu
 #      para equipos de 2-8 GB con disco lento/HDD).
 #
 # Uso:
-#   sudo bash fix-memory.sh
-#   sudo reboot        # necesario para que zswap arranque desde el kernel
+#   sudo bash fix-memory.sh               # oomd + zswap
+#   sudo bash fix-memory.sh --swap 8G     # ademas amplia el swapfile a 8G
+#   sudo bash fix-memory.sh --help
+#
+# El cambio de swap es opcional, solo amplia (nunca reduce) y requiere espacio
+# libre en el disco. swapoff devuelve las paginas a RAM: cierra apps pesadas.
 #
 set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: sudo bash fix-memory.sh [--swap SIZE]
+
+  (sin opciones)  Ajusta systemd-oomd y activa zswap (zstd).
+  --swap SIZE     Ademas amplia el swapfile activo a SIZE (p.ej. 8G, 8192M).
+                  Solo amplia, nunca reduce. Necesita espacio libre y RAM
+                  suficiente para hacer swapoff temporalmente.
+  -h, --help      Muestra esta ayuda.
+EOF
+}
+
+SWAP_SIZE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --swap)
+      if [[ $# -lt 2 ]]; then
+        echo "Falta el tamano para --swap (ej: --swap 8G)" >&2
+        exit 1
+      fi
+      SWAP_SIZE="$2"
+      shift 2
+      ;;
+    --swap=*)
+      SWAP_SIZE="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Opcion desconocida: $1 (usa --help)" >&2
+      exit 1
+      ;;
+  esac
+done
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Ejecuta este script con sudo:  sudo bash $0" >&2
@@ -31,7 +74,68 @@ backup() {
   fi
 }
 
-echo "==> 1/4  Ajustando systemd-oomd (de 50%/20s a 85%/60s)"
+size_to_bytes() {
+  local s="${1^^}"
+  s="${s%B}"
+  if [[ ! "$s" =~ ^[0-9]+[KMGT]?$ ]]; then
+    return 1
+  fi
+  numfmt --from=iec "$s"
+}
+
+find_swapfile() {
+  local name type
+  while read -r name type _; do
+    if [[ "$type" == "file" ]]; then
+      echo "$name"
+      return 0
+    fi
+  done < <(swapon --show=NAME,TYPE --noheadings 2>/dev/null)
+  return 1
+}
+
+grow_swap() {
+  local want="$1" want_bytes swapfile cur_bytes mb
+
+  if ! want_bytes="$(size_to_bytes "$want")"; then
+    echo "  tamano invalido: '$want' (usa p.ej. 4G, 8G, 8192M)" >&2
+    return 1
+  fi
+  if ! swapfile="$(find_swapfile)"; then
+    echo "  no hay swapfile activo; nada que ampliar (esto no crea swap desde cero)" >&2
+    return 1
+  fi
+
+  cur_bytes="$(stat -c %s "$swapfile")"
+  if (( want_bytes <= cur_bytes )); then
+    echo "  swap actual ($(numfmt --to=iec "$cur_bytes")) >= pedido ($want); sin cambios."
+    return 0
+  fi
+
+  echo "  ampliando $swapfile de $(numfmt --to=iec "$cur_bytes") a $want ..."
+  if ! swapoff "$swapfile"; then
+    echo "  no se pudo desactivar el swap. Cierra apps y reintenta." >&2
+    return 1
+  fi
+
+  if ! fallocate -l "$want" "$swapfile" 2>/dev/null; then
+    echo "  fallocate no disponible/fallo; usando dd (puede tardar en HDD)..."
+    mb=$(( (want_bytes + 1048575) / 1048576 ))
+    if ! dd if=/dev/zero of="$swapfile" bs=1M count="$mb" status=progress; then
+      echo "  dd fallo; reactivando el swap como estaba..." >&2
+      mkswap "$swapfile" >/dev/null 2>&1 || true
+      swapon "$swapfile" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  chmod 600 "$swapfile"
+  mkswap "$swapfile" >/dev/null
+  swapon "$swapfile"
+  echo "  swap ampliado: $(swapon --show --noheadings | awk -v f="$swapfile" '$1==f{print $3}')"
+}
+
+echo "==> 1/5  Ajustando systemd-oomd (de 50%/20s a 85%/60s)"
 
 install -d /etc/systemd/oomd.conf.d
 OOMD_CONF=/etc/systemd/oomd.conf.d/99-memory-crash-solver.conf
@@ -55,7 +159,14 @@ cat > "$USER_OOMD" <<'EOF'
 ManagedOOMMemoryPressureLimit=85%
 EOF
 
-echo "==> 2/4  Activando zswap (zstd, max 40% de RAM) de forma persistente"
+echo "==> 2/5  Swap (opcional)"
+if [[ -n "$SWAP_SIZE" ]]; then
+  grow_swap "$SWAP_SIZE" || echo "  (swap sin cambios; continuando con el resto)"
+else
+  echo "  omitido (usa --swap 8G si quieres ampliar el swapfile)"
+fi
+
+echo "==> 3/5  Activando zswap (zstd, max 40% de RAM) de forma persistente"
 
 # Modulos de compresion disponibles en el arranque temprano
 for mod in zstd lz4; do
@@ -74,11 +185,11 @@ else
   echo "  GRUB ya tenia zswap.enabled=1 (sin cambios)"
 fi
 
-echo "==> 3/4  Regenerando initramfs y GRUB"
+echo "==> 4/5  Regenerando initramfs y GRUB"
 update-initramfs -u
 update-grub
 
-echo "==> 4/4  Recargando systemd y aplicando zswap en caliente (si es posible)"
+echo "==> 5/5  Recargando systemd y aplicando zswap en caliente (si es posible)"
 systemctl daemon-reload
 systemctl restart systemd-oomd
 
@@ -98,6 +209,10 @@ echo "===== Verificacion ====="
 echo "--- oomd ---"
 oomctl 2>/dev/null | sed -n '1,20p' || true
 echo
+echo "--- swap ---"
+swapon --show || true
+free -h || true
+echo
 echo "--- zswap ---"
 for f in enabled compressor max_pool_percent; do
   printf '  %s = ' "$f"; cat "/sys/module/zswap/parameters/$f" 2>/dev/null || echo "n/a"
@@ -106,4 +221,4 @@ printf '  Zswap en memoria: '; awk '/^Zswap:/{print $2" "$3}' /proc/meminfo
 echo
 echo "Listo. Reinicia para que zswap arranque desde el kernel:"
 echo "  sudo reboot"
-echo "Despues del reinicio verifica con:  zswap_ok(){ :; }; grep -E 'zswap|Zswap' /proc/meminfo; oomctl"
+echo "Despues del reinicio verifica con:  grep -E 'Zswap|Zswapped' /proc/meminfo; oomctl"
